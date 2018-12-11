@@ -388,16 +388,39 @@ containing fields file, line and col."
 ;; Position management
 
 (defun merlin--goto-point (data)
-  "Go to the point indicated by `DATA' which must be an assoc list with fields
-line and col"
-  (goto-char (point-min))
-  (forward-line (1- (merlin-lookup 'line data 0)))
-  ; caml gives us the byte offset of the column, which doesn't necessarily match
-  ; the character offset, so we can't just use "forward-char"
-  (let* ((bol-offset (position-bytes (point)))
-         (col-offset (max 0 (merlin-lookup 'col data 0)))
-         (target-off (+ bol-offset col-offset)))
-    (goto-char (byte-to-position target-off))))
+  "Go to the point indicated by DATA which must be an assoc list with fields
+line and col. If narrowing is in effect, widen if DATA is outside the visible region."
+  (let ((line-num (merlin-lookup 'line data 0))
+        (col-byte-offset (merlin-lookup 'col data 0))
+        (start-point-min (point-min))
+        (start-point-max (point-max))
+        needs-widen
+        target-pos)
+    (save-restriction
+      (widen)
+
+      (goto-char (point-min))
+      (forward-line (1- line-num))
+
+      ;; Find the target position, converting the byte position to a
+      ;; character offset.
+      (let* ((bol-offset (position-bytes (point)))
+             (col-offset (max 0 col-byte-offset))
+             (target-off (+ bol-offset col-offset)))
+        (setq target-pos (byte-to-position target-off)))
+
+      ;; If our target position is outside the narrowed region, we'll
+      ;; have to widen.
+      (when (or (< target-pos start-point-min)
+                (> target-pos start-point-max))
+        (setq needs-widen t)))
+    (when needs-widen
+      (widen))
+
+    ;; Go to the requested position, converting the absolute position
+    ;; to a narrowing-relative position. Buffer positions start at 1,
+    ;; so subtract 1.
+    (goto-char (- target-pos (1- start-point-min)))))
 
 (defun merlin--point-of-pos (pos)
   "Return the buffer position corresponding to the merlin
@@ -412,12 +435,11 @@ position POS."
     (merlin--goto-point data)
     (point)))
 
-(defun merlin/unmake-point (point)
-  "Destruct POINT to line / col."
-  (save-excursion
-    (goto-char point)
-    (beginning-of-line)
-    (format "%d:%d" (line-number-at-pos) (- point (point)))))
+(defun merlin/unmake-point ()
+  "Destruct the current point position to line / col."
+  (save-restriction
+    (widen)
+    (format "%d:%d" (line-number-at-pos) (current-column))))
 
 (defun merlin--make-bounds (data)
   "From a remote merlin object DATA {\"start\": LOC1; \"end\": LOC2},
@@ -440,9 +462,11 @@ return (LOC1 . LOC2)."
     (with-temp-buffer
       (let ((ob (current-buffer)))
         (with-current-buffer ib
-          (let ((default-directory wd))
-            (apply 'call-process-region (point-min) (point-max) path nil
-                   (list ob tmp) nil args))))
+          (save-restriction
+            (widen)
+            (let ((default-directory wd))
+              (apply 'call-process-region (point-min) (point-max) path nil
+                     (list ob tmp) nil args)))))
       (setq result (buffer-string))
       (merlin-debug "# stdout\n%s" result)
       (when tmp
@@ -897,7 +921,7 @@ prefix of `bar' is `'."
          (suffix (cdr ident-))
          (prefix (car ident-))
          (data   (merlin/call "complete-prefix"
-                              "-position" (merlin/unmake-point (point))
+                              "-position" (merlin/unmake-point)
                               "-prefix" ident
                               "-doc" (if merlin-completion-with-doc "y" "n")))
          ;; all classic entries
@@ -918,7 +942,7 @@ prefix of `bar' is `'."
     ;; DWIM completion
     (when (and merlin-completion-dwim (not labels) (not entries))
       (setq data (merlin/call "expand-prefix"
-                              "-position" (merlin/unmake-point (point))
+                              "-position" (merlin/unmake-point)
                               "-prefix" ident))
       (setq entries (cdr (assoc 'entries data)))
       (setq-local merlin--dwimed t)
@@ -956,11 +980,10 @@ An ocaml atom is any string containing [a-z_0-9A-Z`.]."
 ;; POLARITY SEARCH ;;
 ;;;;;;;;;;;;;;;;;;;;;
 
-(defun merlin--search (query &optional point)
-  (unless point (setq point (point)))
+(defun merlin--search (query)
   (merlin/call "search-by-polarity"
                "-query" query
-               "-position" (merlin/unmake-point point)))
+               "-position" (merlin/unmake-point)))
 
 (defun merlin-search (query)
   (interactive "sSearch pattern: ")
@@ -1031,7 +1054,7 @@ An ocaml atom is any string containing [a-z_0-9A-Z`.]."
   (when exp
     (funcall callback-if-success
              (merlin/call "type-expression"
-                          "-position" (merlin/unmake-point (point))
+                          "-position" (merlin/unmake-point)
                           "-expression" exp))
     ;; FIXME: callback-if-exn
     ))
@@ -1119,7 +1142,7 @@ If QUIET is non nil, then an overlay and the merlin types can be used."
   "Get the enclosings around point from merlin and sets MERLIN-ENCLOSING-TYPES."
   (merlin--type-enclosing-reset)
   (let* ((merlin/verbosity-context t) ; increase verbosity level if necessary
-         (position (merlin/unmake-point (point)))
+         (position (merlin/unmake-point))
          (verbosity (cdr-safe merlin--verbosity-cache))
          (types (merlin/call "type-enclosing" "-position" position "-index" 0))
          (types (ignore-errors
@@ -1209,8 +1232,8 @@ strictly within, or nil if there is no such element."
   "Select the construct enclosing point (or the region, if it is active)."
   (interactive)
   (let* ((enclosing-extents
-           (merlin/call "enclosing"
-                        "-position" (merlin/unmake-point (point))))
+          (merlin/call "enclosing"
+                       "-position" (merlin/unmake-point)))
          (extents (if (use-region-p)
                     (merlin--find-extents enclosing-extents
                                           (region-beginning)
@@ -1237,9 +1260,19 @@ strictly within, or nil if there is no such element."
 
 (defun merlin--destruct-bounds (bounds)
   "Execute a case analysis on BOUNDS"
-  (let ((result (merlin/call "case-analysis"
-                            "-start" (merlin/unmake-point (car bounds))
-                            "-end" (merlin/unmake-point (cdr bounds)))))
+  (let* (start-bounds
+         end-bounds
+         result)
+    (save-restriction
+      (widen)
+      (goto-char (car bounds))
+      (setq start-bounds (point))
+
+      (goto-char (cdr bounds))
+      (setq end-bounds (point)))
+    (setq result
+          (merlin/call "case-analysis" "-start" start-bounds "-end" end-bounds))
+
     (when result
       (let* ((loc   (car result))
              (start (cdr (assoc 'start loc)))
@@ -1334,7 +1367,7 @@ loading"
   "Locate the identifier IDENT at point."
   (let ((result (merlin/call "locate"
                              (when ident (list "-prefix" ident))
-                             "-position" (merlin/unmake-point (point))
+                             "-position" (merlin/unmake-point)
                              "-look-for" merlin-locate-preference)))
     (unless result
       (error "Not found. (Check *Messages* for potential errors)"))
@@ -1378,7 +1411,7 @@ loading"
   (if (or (not target) (equal target ""))
     (setq target "fun let module match"))
   (let ((result (merlin/call "jump"
-                 "-position" (merlin/unmake-point (point))
+                 "-position" (merlin/unmake-point)
                  "-target" target)))
     (unless result
       (error "Not found. (Check *Messages* for potential errors)"))
@@ -1402,7 +1435,7 @@ Empty string defaults to jumping to all these."
   (if (or (not target) (equal target ""))
     (setq target "fun let module match"))
   (let ((result (merlin/call "phrase"
-                 "-position" (merlin/unmake-point (point))
+                 "-position" (merlin/unmake-point)
                  "-target" target)))
     (unless result
       (error "Not found. (Check *Messages* for potential errors)"))
@@ -1427,7 +1460,7 @@ Empty string defaults to jumping to all these."
 (defun merlin--document-pos (ident)
   "Document the identifier IDENT at point and return the result."
   (merlin/call "document"
-               "-position" (merlin/unmake-point (point))
+               "-position" (merlin/unmake-point)
                (when ident (cons "-identifier" ident))))
 
 (defun merlin--document-pure (&optional ident)
@@ -1555,7 +1588,7 @@ Empty string defaults to jumping to all these."
           (t nil))))
 
 (defun merlin--occurrences ()
-  (merlin/call "occurrences" "-identifier-at" (merlin/unmake-point (point))))
+  (merlin/call "occurrences" "-identifier-at" (merlin/unmake-point)))
 
 (defun merlin-occurrences ()
   "List all occurrences of identifier under cursor in buffer."
@@ -1575,7 +1608,7 @@ Empty string defaults to jumping to all these."
   (save-excursion
     (dolist (occurrence (nreverse (merlin/call
                                    "refactor-open"
-                                   "-position" (merlin/unmake-point (point))
+                                   "-position" (merlin/unmake-point)
                                    "-action" mode)))
       (let ((bounds (merlin--make-bounds occurrence))
             (content (cdr (assoc 'content occurrence))))
